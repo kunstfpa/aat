@@ -1,0 +1,120 @@
+#!/usr/bin/perl
+#
+# Request an access_token for an Azure registered application
+# using a client certificate for proof of identity
+#
+# Author: Frans Kunst <frans@atux.nl>
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Config::Tiny;
+use MIME::Base64 qw(encode_base64url);
+use Crypt::OpenSSL::X509;
+use Crypt::OpenSSL::RSA;
+use Data::UUID;
+use JSON;
+use LWP::UserAgent;
+
+my $application;
+my $configfile = "$0.conf";
+my $help;
+
+my $usage = "
+Usage: $0 [OPTIONS] application
+
+Retrieve Access Token for Azure registered Application.
+Prints JSON containing token and metadata.
+
+OPTIONS:
+  --help|-h  This help
+  --conf|-c  Config file. Default $0.conf
+
+Format configfile:
+
+[application]
+tenantid = <tenantid>
+username = <username>>
+clientid = <clientid>
+scope    = <scope>
+cert     = <certfile>
+key      = <keyfile>
+";
+
+GetOptions('conf|c=s' => \$configfile, 'help|h' => \$help) or print STDERR $usage && exit 1;
+
+if ($help) {
+  print $usage;
+  exit 0;
+}
+
+my $app = shift;
+if (! $app) {
+  print STDERR $usage;
+  exit 1;
+}
+
+my $config = Config::Tiny->read($configfile);
+
+if (! $config->{$app}) {
+	print STDERR "Application $app not found in $configfile\n";
+	exit 1;
+}
+
+my $tenantid = $config->{$app}->{tenantid};
+my $username = $config->{$app}->{username};
+my $clientid = $config->{$app}->{clientid};
+my $scope = $config->{$app}->{scope};
+my $cert = $config->{$app}->{cert};
+my $key = $config->{$app}->{key};
+
+# See https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials
+my $x509 = Crypt::OpenSSL::X509->new_from_file($cert);
+my $hexvalue = $x509->fingerprint_sha1;
+# Remove colons
+$hexvalue =~ s/://g;
+# From hex to string
+$hexvalue =~ s/(..)/chr(hex($1))/eg;
+# Convert to Base64 URL encoded string
+my $x5t = encode_base64url($hexvalue);
+
+my $header = encode_json {
+	alg => "RS256",
+	typ => "JWT",
+	x5t => $x5t
+};
+
+my $now = time();
+my $ug = new Data::UUID;
+my $claim = encode_json {
+	aud => "https://login.microsoftonline.com/$tenantid/oauth2/v2.0/token",
+	nbf => $now,
+	exp => $now + 5 * 60,	# access token will be valid for 5 minutes
+	jti => $ug->create_str(),
+	iss => $clientid,
+	sub => $clientid
+};
+
+# Concatenate base64url-encoded header + claim with a dot in between
+my $token_data = encode_base64url($header).".".encode_base64url($claim);
+
+# Read private key file into scalar $key_string
+open my $fh, '<', $key or die "Can't open $key: $!";
+my $key_string = do { local $/; <$fh> };
+
+my $rsa_priv = Crypt::OpenSSL::RSA->new_private_key($key_string);
+$rsa_priv->use_sha256_hash();
+my $signature = $rsa_priv->sign($token_data);
+my $clientassertion = $token_data.".".encode_base64url($signature);
+
+my $ua = new LWP::UserAgent;
+
+my $response = $ua->post("https://login.microsoftonline.com/$tenantid/oauth2/v2.0/token",
+	       { clientid => $clientid,
+	         scope => $scope,
+		 client_assertion_type => "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+		 client_assertion => $clientassertion,
+		 grant_type => "client_credentials"
+	          });
+
+print $response->decoded_content;
